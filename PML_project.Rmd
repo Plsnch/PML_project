@@ -1,0 +1,402 @@
+---
+title: "Predicting exercise execution with accelerometers data"
+author: "Paul Degtyariov"
+date: "12 05 2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Preparing the data
+
+## Activating packages
+
+```{r,message=FALSE,warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(psych)
+library(knitr)
+
+# Here I will use xgboost and ranger packages as they provide convient and fast implementations of classification trees
+library(xgboost)
+library(ranger)
+
+```
+
+## Loading the data
+
+```{r,results='hide'}
+
+url_train <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+url_test <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+path <- getwd()
+
+if(length(grep("pml-trainin.csv",list.files()))==0) {download.file(url,file.path(path,"pml-trainin.csv"))} else print("Downloaded")
+
+
+if(length(grep("pml-testing.csv",list.files()))==0) {download.file(url,file.path(path,"pml-testing.csv"))} else print("Downloaded")
+
+train_data <- read.csv(paste0(path,"/pml-trainin.csv"),stringsAsFactors=FALSE)
+test_data <- read.csv(paste0(path,"/pml-testing.csv"),stringsAsFactors=FALSE)
+
+```
+
+## Processing the data
+
+We would want to remove characters from the data column that should be numeric, impute the NAs with by person mean and eliminate any columns that are empty in training set. Additionally we will remove identifications variables besides username, and perform z-score transformation on the rest of variables.
+
+```{r,warning=FALSE}
+
+train_data1 <- train_data %>% 
+    mutate_all(funs(str_remove_all(.,"#DIV/0!"))) %>% 
+    mutate_at(vars(c(8:ncol(train_data)-1)),as.numeric) %>% 
+    group_by(user_name) %>% 
+    mutate_at(vars(8:ncol(train_data)-1),funs(ifelse(is.na(.),mean(.,na.rm=T),.))) %>% 
+    mutate_at(vars(8:ncol(train_data)-1),funs(ifelse(is.nan(.),mean(.,na.rm=T),.))) %>% 
+    ungroup() %>% 
+    mutate(user_name=paste(X,user_name,sep="_")) %>% 
+    select(user_name,classe,9:ncol(train_data)-1)
+
+#Removing columns with NA/NaN only
+train_data1 <- train_data1[colSums(!is.na(train_data1)) > 0]
+train_data1 <- train_data1[,!sapply(train_data1, function(x) sum(is.nan(x)>0))]
+
+#Removing columns with zero variance
+check_sd <- function(x){
+    if(is.numeric(x)) sd(x,na.rm=T)!=0
+    else TRUE
+}
+train_data1 <- train_data1[,sapply(train_data1,check_sd)]
+
+#We will need mean and sd parameters for every value besides user_name and classe to perform the same z-score transformation on test set
+z_mean <- apply(train_data1[,-c(1,2)],2,mean)
+z_sd <- apply(train_data1[,-c(1,2)],2,sd)
+
+for(i in 1:133){
+  train_data1[,i+2] <- (train_data1[,i+2]-z_mean[i])/z_sd[i]
+}
+
+#Now the same with the test set
+
+test_data1 <- test_data %>% 
+    mutate_all(funs(str_remove_all(.,"#DIV/0!"))) %>% 
+    mutate_at(vars(8:ncol(test_data)-1),as.numeric) %>% 
+    group_by(user_name) %>% 
+    mutate_at(vars(8:ncol(test_data)-1),funs(ifelse(is.na(.),mean(.,na.rm=T),.))) %>% 
+    ungroup() %>% 
+    mutate(user_name=paste(X,user_name,sep="_")) %>% 
+    select(user_name,classe,9:ncol(test_data)-1)
+  
+test_data1 <- test_data1[,which(names(test_data1) %in% names(train_data1))]
+
+for(i in 1:133){
+  test_data1[,i+2] <- (test_data1[,i+2]-z_mean[i])/z_sd[i]
+}
+
+```
+
+## Reducing number of predictors
+As there are lot's of possible predcitors in the data, we can try PCA to reduce their numbers while removing co-liner predictors and hopeful reducing random error
+
+```{r,cache=TRUE,warning=FALSE}
+
+cor_m <- cor(train_data1[sapply(train_data1,is.numeric)],use="pairwise.complete.obs")
+
+fa.parallel(x=cor_m,n.obs=19622,fm="minres",fa="pc")
+
+# Parallel analysis with simulation comparison is suggests 17 principal components are reasonable
+PCA <- pca(r=cor_m,nfactors=17,rotate="none",n.obs=19622)
+
+summary(PCA)
+hist(PCA$residual,breaks=100,xlim=c(-0.3,0.3))
+
+# As we see, the PCA converted quit good with RMSA of 0.01 and absolute majority of residuals close to z
+# Now all we have to do is compute PCs on training and test sets
+
+pc_train <- data.frame(user_name=train_data1$user_name,classe=train_data1$classe,
+                        predict(PCA,data=train_data1[sapply(train_data1,is.numeric)])) %>% 
+  as_tibble()
+
+pc_test <- data.frame(user_name=train_data1$user_name,classe=train_data1$classe,
+                        predict(PCA,data=train_data1[sapply(train_data1,is.numeric)])) %>% 
+  as_tibble()
+
+```
+
+# Model training
+
+As we have quite large sets of predictors and large number of variables, I believe it's reasonable here to make stacked model ensemble of 4:  
+1. Boosted tree on raw predictors with xgboost  
+2. Boosted tree on principal components with xgboost  
+3. Random forest on raw predictors with ranger  
+4. Random forest on principal components with ranger
+
+Each of this models will be trained with random subsampling cross-validation and added to the ensemble if it displays tolerable out-of-sample errors
+
+## 1. Boosted tree on raw predictors with xgboost  
+
+```{r,cache=TRUE}
+
+set.seed(42)
+
+xgb_raw <- NULL
+
+for(i in 1:10){
+  
+  sampler <- sample(1:nrow(train_data1),0.66*nrow(train_data1))
+  
+  cv1 <- train_data1[sampler,-c(1,2)] %>% as.matrix()
+  cv1_y <- train_data1[sampler,2] %>% mutate(classe=as.factor(classe),classe_n=as.integer(classe)-1)
+  cv2 <- train_data1[-sampler,-c(1,2)] %>% as.matrix()
+  cv2_y <- train_data1[-sampler,2] %>% mutate(classe=as.factor(classe),classe_n=as.integer(classe)-1)
+  
+  xgb_fit_raw <- xgb.train(data=xgb.DMatrix(data=cv1,label=cv1_y$classe_n,silent=TRUE),
+                           params=list(booster="gbtree",
+                                       eta=0.05,
+                                       max_depth=10,
+                                       gamma=3,
+                                       objective="multi:softmax",
+                                       num_class=length(unique(cv1_y$classe_n))),
+                           nrounds=500,
+                           verbose=0)
+  
+  xgb_pred_raw_train <- data.frame(orig=cv1_y$classe_n,pred=predict(xgb_fit_raw,xgb.DMatrix(data=cv1,silent=TRUE)))
+  xgb_pred_raw_test <- data.frame(orig=cv2_y$classe_n,pred=predict(xgb_fit_raw,xgb.DMatrix(data=cv2,silent=TRUE)))
+  
+  error_check <- data.frame(iteration=i,
+                            in_sample=sum(xgb_pred_raw_train[,1]==xgb_pred_raw_train[,2])/nrow(xgb_pred_raw_train),
+                            out_sample=sum(xgb_pred_raw_test[,1]==xgb_pred_raw_test[,2])/nrow(xgb_pred_raw_test))
+  
+  xgb_raw <- rbind(xgb_raw,error_check)
+  
+}
+
+ggplot(xgb_raw %>% gather(type,score,-1),aes(x=iteration,y=score))+
+  geom_path(aes(color=type))+
+  geom_point(aes(color=type))+
+  scale_x_continuous(breaks = 1:10)+
+  scale_y_continuous(name="Accuracy",limits=c(0.5,1),breaks=seq(0.5,1,0.02),labels=paste0(seq(0.5,1,0.02)*100,"%"))+
+  ggtitle("Accuracy test for raw predictors boosted trees")
+
+```
+
+As we see out of sample accuracy is a bit less pessimistic, but the difference is around 1% which is tolerable and there is no obvious correlation with in-sample accuracy. This model can be used for quite good prediction on it's own, but let's find out whether is reasonable to build an ensemble  
+
+## 2. Boosted tree on principal components with xgboost 
+
+```{r,cache=TRUE}
+
+set.seed(42)
+
+xgb_pc <- NULL
+
+for(i in 1:10){
+  
+  sampler <- sample(1:nrow(train_data1),0.66*nrow(train_data1))
+  
+  cv1 <- pc_train[sampler,-c(1,2)] %>% as.matrix()
+  cv1_y <- pc_train[sampler,2] %>% mutate(classe=as.factor(classe),classe_n=as.integer(classe)-1)
+  cv2 <- pc_test[-sampler,-c(1,2)] %>% as.matrix()
+  cv2_y <- pc_test[-sampler,2] %>% mutate(classe=as.factor(classe),classe_n=as.integer(classe)-1)
+  
+  xgb_fit_pc <- xgb.train(data=xgb.DMatrix(data=cv1,label=cv1_y$classe_n,silent=TRUE),
+                           params=list(booster="gbtree",
+                                       eta=0.05,
+                                       max_depth=3,
+                                       gamma=3,
+                                       objective="multi:softmax",
+                                       num_class=length(unique(cv1_y$classe_n))),
+                           nrounds=500,
+                           verbose=0)
+  
+  xgb_pred_pc_train <- data.frame(orig=cv1_y$classe_n,pred=predict(xgb_fit_pc,xgb.DMatrix(data=cv1,silent=TRUE)))
+  xgb_pred_pc_test <- data.frame(orig=cv2_y$classe_n,pred=predict(xgb_fit_pc,xgb.DMatrix(data=cv2,silent=TRUE)))
+  
+  error_check <- data.frame(iteration=i,
+                            in_sample=sum(xgb_pred_pc_train[,1]==xgb_pred_pc_train[,2])/nrow(xgb_pred_pc_train),
+                            out_sample=sum(xgb_pred_pc_test[,1]==xgb_pred_pc_test[,2])/nrow(xgb_pred_pc_test))
+  
+  xgb_pc <- rbind(xgb_pc,error_check)
+  
+}
+
+ggplot(xgb_pc %>% gather(type,score,-1),aes(x=iteration,y=score))+
+  geom_path(aes(color=type))+
+  geom_point(aes(color=type))+
+  scale_x_continuous(breaks = 1:10)+
+  scale_y_continuous(name="Accuracy",limits=c(0.5,1),breaks=seq(0.5,1,0.02),labels=paste0(seq(0.5,1,0.02)*100,"%"))+
+  ggtitle("Accuracy test for principal components boosted trees")
+
+```
+
+For boosted trees based on PC there is a more recognizable drop in accuracy from in sample to out of sample accuracy, 4-5%. The accuracy itself is less promising and generally lower than for raw boosted trees.  
+
+## 3. Random forest on raw predictors with ranger  
+
+```{r,cache=TRUE}
+
+set.seed(42)
+
+rf_raw <- NULL
+
+for(i in 1:10){
+  
+  sampler <- sample(1:nrow(train_data1),0.66*nrow(train_data1))
+  
+  cv1 <- train_data1[sampler,-1] %>% mutate(classe=as.factor(classe))
+  cv2 <- train_data1[-sampler,-1] %>% mutate(classe=as.factor(classe))
+  
+  rf_fit_raw <- ranger(formula="classe~.",
+                       data=cv1 %>% as.data.frame(),
+                       num.trees=500,
+                       mtry=round(sqrt(ncol(cv1)-1),0),
+                       write.forest=TRUE,
+                       splitrule="gini",
+                       verbose=FALSE)
+  
+  # You need to be very accurate here - ranger cannot be shown observations it has already seen in trarining
+  # It will results in major overfit of predictions
+  # That's why I get predictions on training data from the ranger object directly
+  rf_fit_raw_train <- data.frame(orig=cv1$classe,pred=rf_fit_raw$predictions)
+  rf_fit_raw_test <- data.frame(orig=cv2$classe,pred=predict(rf_fit_raw,cv2)$predictions)
+  
+  error_check <- data.frame(iteration=i,
+                            in_sample=sum(rf_fit_raw_train[,1]==rf_fit_raw_train[,2])/nrow(rf_fit_raw_train),
+                            out_sample=sum(rf_fit_raw_test[,1]==rf_fit_raw_test[,2])/nrow(rf_fit_raw_test))
+  
+  rf_raw <- rbind(rf_raw,error_check)
+  
+}
+
+ggplot(rf_raw %>% gather(type,score,-1),aes(x=iteration,y=score))+
+  geom_path(aes(color=type))+
+  geom_point(aes(color=type))+
+  scale_x_continuous(breaks = 1:10)+
+  scale_y_continuous(name="Accuracy",limits=c(0.5,1),breaks=seq(0.5,1,0.02),labels=paste0(seq(0.5,1,0.02)*100,"%"))+
+  ggtitle("Accuracy test for raw predictors random forest")
+
+```
+
+Random forest on raw predictors displays excellent accuracy (>0.993) on itself and is quite resistant to overfitting - out-of-sample errors divert in less then 0.0003
+
+## 4. Random forest on principal components with ranger  
+
+```{r,cache=TRUE}
+
+set.seed(42)
+
+rf_pc <- NULL
+
+for(i in 1:10){
+  
+  sampler <- sample(1:nrow(train_data1),0.66*nrow(train_data1))
+  
+  cv1 <- pc_train[sampler,-1] %>% mutate(classe=as.factor(classe))
+  cv2 <- pc_train[-sampler,-1] %>% mutate(classe=as.factor(classe))
+  
+  rf_fit_pc <- ranger(formula="classe~.",
+                       data=cv1 %>% as.data.frame(),
+                       num.trees=500,
+                       mtry=round(sqrt(ncol(cv1)-1),0),
+                       write.forest=TRUE,
+                       splitrule="gini",
+                       verbose=FALSE)
+  
+  rf_fit_pc_train <- data.frame(orig=cv1$classe,pred=rf_fit_pc$predictions)
+  rf_fit_pc_test <- data.frame(orig=cv2$classe,pred=predict(rf_fit_pc,cv2)$predictions)
+  
+  error_check <- data.frame(iteration=i,
+                            in_sample=sum(rf_fit_pc_train[,1]==rf_fit_pc_train[,2])/nrow(rf_fit_pc_train),
+                            out_sample=sum(rf_fit_pc_test[,1]==rf_fit_pc_test[,2])/nrow(rf_fit_pc_test))
+  
+  rf_pc <- rbind(rf_pc,error_check)
+  
+}
+
+ggplot(rf_pc %>% gather(type,score,-1),aes(x=iteration,y=score))+
+  geom_path(aes(color=type))+
+  geom_point(aes(color=type))+
+  scale_x_continuous(breaks = 1:10)+
+  scale_y_continuous(name="Accuracy",limits=c(0.5,1),breaks=seq(0.5,1,0.02),labels=paste0(seq(0.5,1,0.02)*100,"%"))+
+  ggtitle("Accuracy test for principal components random forest")
+
+```
+
+Random forest on principal components has less accuracy compared to raw predictors one, some 0.95. The diversion of in-sample and out of sample accuracies is a bit bigger too.  
+
+Thus, we have 4 models, with each of them displaying quite good accuracy and reasonable out-of-sample errors. No it's finally the time to validate them with test data on them own and in a an ensemble
+
+# Test-data validation
+
+```{r}
+
+test_predictions1 <- data.frame(user_name = test_data1$user_name,
+  classe=test_data1$classe,
+  xgb_raw_test=predict(xgb_fit_raw,xgb.DMatrix(data=test_data1[,-c(1,2)] %>% as.matrix(),silent=TRUE)),
+  xgb_pc_test=predict(xgb_fit_pc,xgb.DMatrix(data=pc_test[,-c(1,2)] %>% as.matrix(),silent=TRUE)),
+  rf_raw_test=predict(rf_fit_raw,test_data1[,-c(1,2)])$predictions %>% as.character(),
+  rf_pc_test=predict(rf_fit_pc,pc_test[,-c(1,2)])$prediction %>% as.character(),
+  row.names=NULL,
+  stringsAsFactors=FALSE) %>% 
+  mutate(xgb_raw_test=recode(xgb_raw_test,`0`="A",`1`="B",`2`="C",`3`="D",`4`="E")) %>% 
+  mutate(xgb_pc_test=recode(xgb_pc_test,`0`="A",`1`="B",`2`="C",`3`="D",`4`="E"))
+
+# Here we define cummulative prediction by majority. If there is a tie between models, the prediction will be defined as missed
+test_predictions2 <- test_predictions1 %>% 
+  gather(model,cummulative,-c(user_name,classe)) %>% 
+  group_by(user_name,cummulative) %>% 
+  summarise(n=n()) %>% 
+  ungroup() %>% 
+  group_by(user_name) %>% 
+  filter(n==max(n)) %>% 
+  ungroup() %>% 
+  mutate(cummulative=ifelse(n==2,"missed",cummulative)) %>% 
+  select(-n) %>% 
+  distinct()
+
+# As principal components boosted trees has shown poor performance, a separate cummultaive score is constructed without it
+test_predictions3 <- test_predictions1 %>% 
+  select(-xgb_pc_test) %>% 
+  gather(model,cummulative_noxgbpc,-c(user_name,classe)) %>% 
+  group_by(user_name,cummulative_noxgbpc) %>% 
+  summarise(n=n()) %>% 
+  ungroup() %>% 
+  group_by(user_name) %>% 
+  filter(n==max(n)) %>% 
+  ungroup() %>% 
+  mutate(cummulative_noxgbpc=ifelse(n==1,"missed",cummulative_noxgbpc)) %>% 
+  select(-n) %>% 
+  distinct()
+
+# Also, a separate cummulative score is constructed for 2 best models which are raw predictors
+test_predictions4 <- test_predictions1 %>% 
+  select(-xgb_pc_test,-rf_pc_test) %>% 
+  gather(model,cummulative_nopc,-c(user_name,classe)) %>% 
+  group_by(user_name,cummulative_nopc) %>% 
+  summarise(n=n()) %>% 
+  ungroup() %>% 
+  group_by(user_name) %>% 
+  filter(n==max(n)) %>% 
+  ungroup() %>% 
+  mutate(cummulative_nopc=ifelse(n==1,"missed",cummulative_nopc)) %>% 
+  select(-n) %>% 
+  distinct()
+
+test_fin <- test_predictions1 %>% 
+  inner_join(test_predictions2,by="user_name") %>% 
+  inner_join(test_predictions3,by="user_name") %>% 
+  inner_join(test_predictions4,by="user_name") %>% 
+  gather(predictor,prediction,-c(user_name,classe)) %>% 
+  group_by(predictor) %>% 
+  summarise(accuracy=sum(prediction==classe)/n()) %>% 
+  ungroup() %>% 
+  arrange(desc(accuracy))
+
+kable(test_fin)
+
+```
+
+Turns out the whole ensemble paid off - it's the most accurate prediction when we account for both random forests and boosted trees on raw predictors. The total accuracy of classification is **99.83692%**. It'is as much as 0.01529% accurate than the closest single model which is random forest based on raw predictors.  
